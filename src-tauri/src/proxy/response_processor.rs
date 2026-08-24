@@ -5,6 +5,7 @@
 use super::{
     content_encoding::{decompress_body_with_limit, get_content_encoding, DecompressError},
     forwarder::ActiveConnectionGuard,
+    full_logger::{SseFullLogCollector, SseFullLogFinishGuard},
     handler_config::{StreamUsageEventFilter, UsageParserConfig},
     handler_context::{RequestContext, StreamingTimeoutConfig},
     hyper_client::{ProxyResponse, MAX_RESPONSE_BODY_BYTES},
@@ -186,6 +187,9 @@ pub async fn handle_streaming(
 
     // 创建使用量收集器；关闭 usage logging 时不要在流式热路径上解析每个 SSE event。
     let usage_collector = create_usage_collector(ctx, state, status.as_u16(), parser_config);
+    // 创建 full-log 收集器（仅在开关开启时返回 Some）
+    let full_log_collector =
+        create_full_log_collector_for_stream(ctx, state, true, status.as_u16());
 
     // 获取流式超时配置
     let timeout_config = ctx.streaming_timeout_config();
@@ -195,6 +199,7 @@ pub async fn handle_streaming(
         stream,
         ctx.tag,
         usage_collector,
+        full_log_collector,
         timeout_config,
         connection_guard,
     );
@@ -234,6 +239,26 @@ pub async fn handle_non_streaming(
         ctx.tag,
         body_bytes.len()
     );
+
+    // Full-logging：非流式直接把 body JSON（或原文）连同 request_snapshot 落盘。
+    // 纯透传无转换，两视点内容一致，任一视点开启即记一条（Upstream 视点）。
+    if full_logging_enabled(state) && (full_log_upstream(state) || full_log_client(state)) {
+        let response_value = serde_json::from_slice::<Value>(&body_bytes)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&body_bytes).to_string()));
+        let error = if status.is_success() {
+            None
+        } else {
+            Some(format!("upstream status {}", status.as_u16()))
+        };
+        spawn_full_log_record(
+            ctx,
+            false,
+            response_value,
+            status.as_u16(),
+            error,
+            super::FullLogPerspective::Upstream,
+        );
+    }
 
     // 解析并记录使用量。关闭 usage logging 时直接跳过，避免非流式响应整包 JSON parse。
     if usage_logging_enabled(state) {
@@ -615,6 +640,210 @@ pub(crate) fn usage_logging_enabled(state: &ProxyState) -> bool {
         .unwrap_or(true)
 }
 
+/// Full-logging 开关：从 `ProxyState.config` 读取。读锁拿不到时按"未开启"处理，
+/// 这样运行时偶发竞争不会让本期未启用 full-log 的用户突然出现日志。
+pub(crate) fn full_logging_enabled(state: &ProxyState) -> bool {
+    state
+        .config
+        .try_read()
+        .map(|config| config.full_logging_enabled)
+        .unwrap_or(false)
+}
+
+/// 是否记录上游视点（转换后请求 + 上游原始响应）。读锁拿不到时按默认 true 处理。
+pub(crate) fn full_log_upstream(state: &ProxyState) -> bool {
+    state
+        .config
+        .try_read()
+        .map(|config| config.full_log_upstream)
+        .unwrap_or(true)
+}
+
+/// 是否记录客户端视点（客户端原始请求 + 转换后响应）。读锁拿不到时按 false 处理。
+pub(crate) fn full_log_client(state: &ProxyState) -> bool {
+    state
+        .config
+        .try_read()
+        .map(|config| config.full_log_client)
+        .unwrap_or(false)
+}
+
+/// 构造一个 SSE 流式 full-log 收集器（仅在开关开启时返回 Some）。
+///
+/// 非转换路径（纯透传）专用：上游与客户端 body 一致，两视点内容相同，
+/// 只记一条即可，固定用 Upstream 视点。
+///
+/// `on_complete` 在流结束时拿到聚合后的完整 response JSON，并以 `tokio::spawn`
+/// 异步追加到当日 JSONL 文件，确保不阻塞转发链路。
+pub(crate) fn create_full_log_collector_for_stream(
+    ctx: &RequestContext,
+    state: &ProxyState,
+    is_streaming: bool,
+    status_code: u16,
+) -> Option<SseFullLogCollector> {
+    // 纯透传无转换：任一视点开启即记录一条（Upstream 视点）。
+    if !full_logging_enabled(state) || !(full_log_upstream(state) || full_log_client(state)) {
+        return None;
+    }
+    let aggregator = super::full_logger::select_aggregator(ctx.app_type_str, &ctx.endpoint);
+    Some(build_full_log_collector(
+        ctx,
+        aggregator,
+        is_streaming,
+        status_code,
+        super::FullLogPerspective::Upstream,
+    ))
+}
+
+/// 用调用方指定的聚合器构造 full-log 收集器（仅在开关开启时返回 Some）。
+///
+/// Claude transform 路径专用：上游真实协议（OpenAI / Responses）与客户端
+/// endpoint（`/v1/messages`）不一致，不能用 `select_aggregator` 按 endpoint 选，
+/// 需由调用方按 `api_format` 显式给出聚合器，以记录转换前的上游原始报文。
+///
+/// `perspective` 由调用方按其挂载位置指定（转换前=Upstream / 转换后=Client）；
+/// 开关判断由调用方负责（见 handlers 的独立 if 分支）。
+pub(crate) fn create_full_log_collector_with_aggregator(
+    ctx: &RequestContext,
+    state: &ProxyState,
+    aggregator: Box<dyn super::full_logger::SseAggregator + Send>,
+    is_streaming: bool,
+    status_code: u16,
+    perspective: super::FullLogPerspective,
+) -> Option<SseFullLogCollector> {
+    if !full_logging_enabled(state) {
+        return None;
+    }
+    Some(build_full_log_collector(
+        ctx,
+        aggregator,
+        is_streaming,
+        status_code,
+        perspective,
+    ))
+}
+
+/// 公共构造逻辑：捕获 ctx 字段，返回一个在流结束时落盘的收集器。
+///
+/// 按 `perspective` 决定 request / endpoint / model 来源：
+/// - Upstream：用代理发往上游的值（转换后）
+/// - Client：用客户端原始值（快照）
+fn build_full_log_collector(
+    ctx: &RequestContext,
+    aggregator: Box<dyn super::full_logger::SseAggregator + Send>,
+    is_streaming: bool,
+    status_code: u16,
+    perspective: super::FullLogPerspective,
+) -> SseFullLogCollector {
+    let request_id = ctx.request_id.clone();
+    let provider_id = ctx.provider.id.clone();
+    let app_type = ctx.app_type_str.to_string();
+    let (endpoint, model, request) = match perspective {
+        super::FullLogPerspective::Client => (
+            ctx.endpoint.clone(),
+            ctx.request_model.clone(),
+            ctx.request_snapshot.clone(),
+        ),
+        super::FullLogPerspective::Upstream => (
+            ctx.outbound_endpoint
+                .clone()
+                .unwrap_or_else(|| ctx.endpoint.clone()),
+            ctx.outbound_model
+                .clone()
+                .unwrap_or_else(|| ctx.request_model.clone()),
+            ctx.outbound_request
+                .clone()
+                .unwrap_or_else(|| ctx.request_snapshot.clone()),
+        ),
+    };
+    let session_id = ctx.session_id.clone();
+    let session_client_provided = ctx.session_client_provided;
+    let start_time = ctx.start_time;
+    SseFullLogCollector::new(aggregator, move |response| {
+        let request_id = request_id.clone();
+        let provider_id = provider_id.clone();
+        let app_type = app_type.clone();
+        let endpoint = endpoint.clone();
+        let model = model.clone();
+        let request = request.clone();
+        let session_id = session_id.clone();
+        let duration_ms = start_time.elapsed().as_millis() as u64;
+        let record = super::full_logger::FullLogRecord::new(
+            request_id,
+            session_id,
+            session_client_provided,
+            provider_id,
+            app_type,
+            perspective,
+            endpoint,
+            model,
+            duration_ms,
+            is_streaming,
+            request,
+            response,
+            status_code,
+            None,
+        );
+        tokio::spawn(async move {
+            super::full_logger::append_record(record).await;
+        });
+    })
+}
+
+/// 非流式 / 转换后路径的 full-log 落盘（直接喂 response JSON）。
+///
+/// 调用方负责在 `full_logging_enabled(state) == true` 时调用；
+/// 该函数自身只负责拼装记录并异步写入。
+/// `perspective` 决定记录的是客户端原始请求还是代理转换后的请求。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_full_log_record(
+    ctx: &RequestContext,
+    is_streaming: bool,
+    response: Value,
+    status_code: u16,
+    error: Option<String>,
+    perspective: super::FullLogPerspective,
+) {
+    let request_id = ctx.request_id.clone();
+    let (model, endpoint, request) = match perspective {
+        super::FullLogPerspective::Client => (
+            ctx.request_model.clone(),
+            ctx.endpoint.clone(),
+            ctx.request_snapshot.clone(),
+        ),
+        super::FullLogPerspective::Upstream => (
+            ctx.outbound_model
+                .clone()
+                .unwrap_or_else(|| ctx.request_model.clone()),
+            ctx.outbound_endpoint
+                .clone()
+                .unwrap_or_else(|| ctx.endpoint.clone()),
+            ctx.outbound_request
+                .clone()
+                .unwrap_or_else(|| ctx.request_snapshot.clone()),
+        ),
+    };
+    let record = super::full_logger::FullLogRecord::new(
+        request_id,
+        ctx.session_id.clone(),
+        ctx.session_client_provided,
+        ctx.provider.id.clone(),
+        ctx.app_type_str.to_string(),
+        perspective,
+        endpoint,
+        model,
+        ctx.latency_ms(),
+        is_streaming,
+        request,
+        response,
+        status_code,
+        error,
+    );
+    tokio::spawn(async move {
+        super::full_logger::append_record(record).await;
+    });
+}
+
 /// 内部使用量记录函数
 ///
 /// `outbound_model` 是「按请求计价」模式的锚点：实际发往上游的模型
@@ -684,6 +913,7 @@ pub fn create_logged_passthrough_stream(
     stream: impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
     tag: &'static str,
     usage_collector: Option<SseUsageCollector>,
+    full_log_collector: Option<SseFullLogCollector>,
     timeout_config: StreamingTimeoutConfig,
     connection_guard: Option<ActiveConnectionGuard>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
@@ -693,8 +923,11 @@ pub fn create_logged_passthrough_stream(
         let mut utf8_remainder: Vec<u8> = Vec::new();
         let mut collector = usage_collector;
         let mut finish_guard = collector.clone().map(SseUsageFinishGuard::new);
-        let inspect_sse_events =
-            collector.is_some() || log::log_enabled!(log::Level::Debug);
+        let mut full_log = full_log_collector;
+        let mut full_log_guard = full_log.clone().map(SseFullLogFinishGuard::new);
+        let inspect_sse_events = collector.is_some()
+            || full_log.is_some()
+            || log::log_enabled!(log::Level::Debug);
         let mut is_first_chunk = true;
 
         // 超时配置
@@ -755,14 +988,32 @@ pub fn create_logged_passthrough_stream(
                                 for line in event_text.lines() {
                                     if let Some(data) = strip_sse_field(line, "data") {
                                         if data.trim() != "[DONE]" {
+                                            // full-log collector 需要解析 JSON 出聚合器
+                                            let parsed_for_full_log: Option<Value> =
+                                                if full_log.is_some() {
+                                                    serde_json::from_str::<Value>(data).ok()
+                                                } else {
+                                                    None
+                                                };
+                                            if let (Some(c), Some(v)) =
+                                                (full_log.as_ref(), parsed_for_full_log.as_ref())
+                                            {
+                                                c.push(v.clone()).await;
+                                            }
                                             let collected = match &collector {
                                                 Some(c) if c.should_collect(data) => {
-                                                    match serde_json::from_str::<Value>(data) {
-                                                        Ok(json_value) => {
+                                                    // 已经为 full-log 解析过则复用，避免双解析
+                                                    let parsed = parsed_for_full_log
+                                                        .clone()
+                                                        .or_else(|| {
+                                                            serde_json::from_str::<Value>(data).ok()
+                                                        });
+                                                    match parsed {
+                                                        Some(json_value) => {
                                                             c.push(json_value).await;
                                                             true
                                                         }
-                                                        Err(_) => false,
+                                                        None => false,
                                                     }
                                                 }
                                                 _ => false,
@@ -798,6 +1049,12 @@ pub fn create_logged_passthrough_stream(
             c.finish().await;
         }
         if let Some(guard) = &mut finish_guard {
+            guard.disarm();
+        }
+        if let Some(c) = full_log.take() {
+            c.finish().await;
+        }
+        if let Some(guard) = &mut full_log_guard {
             guard.disarm();
         }
     }

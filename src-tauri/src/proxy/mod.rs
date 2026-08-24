@@ -11,6 +11,7 @@ pub mod error;
 pub mod error_mapper;
 pub(crate) mod failover_switch;
 mod forwarder;
+pub mod full_logger;
 pub mod gemini_url;
 pub mod handler_config;
 pub mod handler_context;

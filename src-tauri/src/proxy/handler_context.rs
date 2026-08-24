@@ -64,12 +64,27 @@ pub struct RequestContext {
     pub session_id: String,
     /// Session ID 是否由客户端提供。生成的 UUID 不能作为上游缓存 key，否则每个请求都会换 key。
     pub session_client_provided: bool,
+    /// 本次请求的唯一标识（UUIDv4，入口处生成一次）。
+    /// full-log 的 Upstream/Client 两视点共享同一值，用于跨视点关联同一次请求。
+    pub request_id: String,
     /// 整流器配置
     pub rectifier_config: RectifierConfig,
     /// 优化器配置
     pub optimizer_config: OptimizerConfig,
     /// Copilot 优化器配置
     pub copilot_optimizer_config: CopilotOptimizerConfig,
+    /// 客户端发往代理的请求体 JSON 快照（克隆自 handler 入口的 body）。
+    /// 仅在 full-logging 开启时用于落盘；关闭路径上保留为 Null，避免拷贝开销。
+    pub request_snapshot: serde_json::Value,
+    /// 请求 endpoint（如 `/v1/messages`、`/v1/responses`），用于 full-log 聚合器路由
+    /// 与落盘记录。Gemini 路径在 `with_model_from_uri` 之后可再覆盖一次。
+    pub endpoint: String,
+    /// 实际发往上游的 endpoint（格式转换后，如 `/v1/chat/completions`）。
+    /// 仅 full-logging 开启且 forward 成功后回填；否则为 None。
+    pub outbound_endpoint: Option<String>,
+    /// 实际发往上游的请求体（所有映射/转换/过滤之后的最终 body）。
+    /// 仅 full-logging 开启且 forward 成功后回填；否则为 None。
+    pub outbound_request: Option<serde_json::Value>,
 }
 
 impl RequestContext {
@@ -92,6 +107,7 @@ impl RequestContext {
         app_type: AppType,
         tag: &'static str,
         app_type_str: &'static str,
+        endpoint: &str,
     ) -> Result<Self, ProxyError> {
         let start_time = Instant::now();
 
@@ -120,6 +136,8 @@ impl RequestContext {
         // 提取 Session ID
         let session_result = extract_session_id(headers, body, app_type_str);
         let session_id = session_result.session_id.clone();
+
+        let request_id = uuid::Uuid::new_v4().to_string();
 
         log::debug!(
             "[{}] Session ID: {} (from {:?}, client_provided: {})",
@@ -157,6 +175,19 @@ impl RequestContext {
             session_id
         );
 
+        // 只有 full-logging 开启时才克隆请求体快照（body 可能很大：长 prompt、多图等）。
+        // 关闭路径上保留为 Null，避免拷贝大对象的内存与序列化开销。
+        let full_logging_on = state
+            .config
+            .try_read()
+            .map(|c| c.full_logging_enabled)
+            .unwrap_or(false);
+        let request_snapshot = if full_logging_on {
+            body.clone()
+        } else {
+            serde_json::Value::Null
+        };
+
         Ok(Self {
             start_time,
             app_config,
@@ -170,9 +201,14 @@ impl RequestContext {
             app_type,
             session_id,
             session_client_provided: session_result.client_provided,
+            request_id,
             rectifier_config,
             optimizer_config,
             copilot_optimizer_config,
+            request_snapshot,
+            endpoint: endpoint.to_string(),
+            outbound_endpoint: None,
+            outbound_request: None,
         })
     }
 
@@ -187,6 +223,12 @@ impl RequestContext {
 
         self.request_model =
             extract_gemini_model_from_path(endpoint).unwrap_or_else(|| "unknown".to_string());
+        // Gemini 路径在创建 ctx 时 endpoint 还不知道（path_and_query 在 handle_gemini
+        // 里才取得），这里把完整 endpoint 覆盖回 ctx 用于 full-log 路由与落盘
+        self.endpoint = uri
+            .path_and_query()
+            .map(|pq| pq.as_str().to_string())
+            .unwrap_or_else(|| endpoint.to_string());
 
         self
     }

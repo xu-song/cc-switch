@@ -383,6 +383,24 @@ impl ProxyServer {
         *self.state.config.write().await = config.clone();
     }
 
+    /// 仅热更新 full_logging_enabled 字段。
+    ///
+    /// `update_proxy_config` 路径走的是兼容旧 `ProxyConfig`，不携带该字段；
+    /// 此入口由 GlobalProxyConfig 的切换专用，避免改完要重启代理才生效。
+    pub async fn apply_full_logging(&self, full_logging_enabled: bool) {
+        let mut cfg = self.state.config.write().await;
+        cfg.full_logging_enabled = full_logging_enabled;
+    }
+
+    /// 仅热更新 full_log_upstream / full_log_client 两个视点开关。
+    ///
+    /// 与 apply_full_logging 同理，由 GlobalProxyConfig 切换专用。
+    pub async fn apply_full_log_flags(&self, upstream: bool, client: bool) {
+        let mut cfg = self.state.config.write().await;
+        cfg.full_log_upstream = upstream;
+        cfg.full_log_client = client;
+    }
+
     /// 热更新熔断器配置
     ///
     /// 将新配置应用到所有已创建的熔断器实例

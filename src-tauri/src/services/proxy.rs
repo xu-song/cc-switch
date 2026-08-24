@@ -3946,6 +3946,25 @@ impl ProxyService {
         self.server.read().await.is_some()
     }
 
+    /// 把 full-logging 开关实时同步到运行中的代理服务器的 `ProxyState.config`。
+    ///
+    /// `update_proxy_config` 路径不携带 full_logging_enabled（兼容旧接口），
+    /// 因此从前端"全局配置"开关切换时需要单独同步一次，否则改完要重启代理才生效。
+    /// 未运行时静默返回。
+    pub async fn apply_full_logging_runtime(&self, full_logging_enabled: bool) {
+        if let Some(server) = self.server.read().await.as_ref() {
+            server.apply_full_logging(full_logging_enabled).await;
+        }
+    }
+
+    /// 同 apply_full_logging_runtime，用于切换 full_log_upstream / full_log_client。
+    /// 未运行时静默返回。
+    pub async fn apply_full_log_flags_runtime(&self, upstream: bool, client: bool) {
+        if let Some(server) = self.server.read().await.as_ref() {
+            server.apply_full_log_flags(upstream, client).await;
+        }
+    }
+
     /// 热更新熔断器配置
     ///
     /// 如果代理服务器正在运行，将新配置应用到所有已创建的熔断器实例

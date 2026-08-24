@@ -1,5 +1,30 @@
 use serde::{Deserialize, Serialize};
 
+/// 完整日志记录视点。
+///
+/// 单条记录只能是一个视点；两个视点可同时开启（见 `full_log_upstream` /
+/// `full_log_client`），届时一次请求会落两条记录，靠本字段区分。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FullLogPerspective {
+    /// 代理与上游之间的真实数据（转换后请求 + 上游原始响应，默认）；
+    /// 适用于排查代理到上游的交互问题。
+    #[default]
+    Upstream,
+    /// 客户端视角（客户端原始请求 + 转换后响应）；
+    /// 适用于复现客户端端所见的完整对话。
+    Client,
+}
+
+impl FullLogPerspective {
+    /// 落盘时写入 `perspective` 字段的稳定字符串标识。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Upstream => "upstream",
+            Self::Client => "client",
+        }
+    }
+}
+
 /// 代理服务器配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
@@ -13,6 +38,15 @@ pub struct ProxyConfig {
     pub request_timeout: u64,
     /// 是否启用日志
     pub enable_logging: bool,
+    /// 是否启用完整请求/响应日志记录
+    #[serde(default)]
+    pub full_logging_enabled: bool,
+    /// 是否记录上游视点（转换后请求 + 上游原始响应）。默认开启。
+    #[serde(default = "default_true")]
+    pub full_log_upstream: bool,
+    /// 是否记录客户端视点（客户端原始请求 + 转换后响应）。默认关闭。
+    #[serde(default)]
+    pub full_log_client: bool,
     /// 是否正在接管 Live 配置
     #[serde(default)]
     pub live_takeover_active: bool,
@@ -47,6 +81,9 @@ impl Default for ProxyConfig {
             max_retries: 3,
             request_timeout: 600,
             enable_logging: true,
+            full_logging_enabled: false,
+            full_log_upstream: true,
+            full_log_client: false,
             live_takeover_active: false,
             streaming_first_byte_timeout: 60,
             streaming_idle_timeout: 120,
@@ -154,6 +191,14 @@ pub struct GlobalProxyConfig {
     pub listen_port: u16,
     /// 是否启用日志
     pub enable_logging: bool,
+    /// 是否启用完整请求/响应日志记录到 ~/.cc-switch/proxy_full_logs
+    pub full_logging_enabled: bool,
+    /// 是否记录上游视点（转换后请求 + 上游原始响应）。默认开启。
+    #[serde(default = "default_true")]
+    pub full_log_upstream: bool,
+    /// 是否记录客户端视点（客户端原始请求 + 转换后响应）。默认关闭。
+    #[serde(default)]
+    pub full_log_client: bool,
 }
 
 /// 应用级代理配置（每个 app 独立）

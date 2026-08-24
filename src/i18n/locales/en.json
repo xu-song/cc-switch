@@ -2833,6 +2833,18 @@
           "label": "Record Request Usage",
           "description": "Write routing request usage and status to the local statistics database"
         },
+        "fullLogging": {
+          "label": "Record full request & response",
+          "description": "Write each session to ~/.cc-switch/proxy_full_logs/<app>/<session-id>.jsonl (messages, tool_use, etc.). File names match the CLI logs. May contain prompts and private data."
+        },
+        "fullLogMode": {
+          "label": "Logged content",
+          "upstream": "Upstream",
+          "client": "Client",
+          "upstreamDescription": "Record the transformed request and the upstream's raw response (for debugging proxy-to-upstream traffic).",
+          "clientDescription": "Record the client's original request and the transformed response (to reproduce what the client sees).",
+          "atLeastOne": "Keep at least one logging perspective enabled."
+        },
         "streamingFirstByteTimeout": {
           "label": "Streaming First Byte Timeout (sec)",
           "description": "Maximum time to wait for the first data chunk"

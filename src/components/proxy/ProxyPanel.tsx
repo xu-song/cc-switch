@@ -128,6 +128,62 @@ export function ProxyPanel({
     }
   };
 
+  const handleFullLoggingChange = async (enabled: boolean) => {
+    if (!globalConfig) return;
+    try {
+      await updateGlobalConfig.mutateAsync({
+        ...globalConfig,
+        fullLoggingEnabled: enabled,
+      });
+      toast.success(
+        enabled
+          ? t("proxy.fullLogging.enabled", {
+              defaultValue: "完整请求日志已启用",
+            })
+          : t("proxy.fullLogging.disabled", {
+              defaultValue: "完整请求日志已关闭",
+            }),
+        { closeButton: true },
+      );
+    } catch (error) {
+      toast.error(
+        t("proxy.fullLogging.failed", {
+          defaultValue: "切换完整请求日志失败",
+        }),
+      );
+    }
+  };
+
+  const handleFullLogFlagChange = async (
+    field: "fullLogUpstream" | "fullLogClient",
+    value: boolean,
+  ) => {
+    if (!globalConfig) return;
+    if (globalConfig[field] === value) return;
+    // 至少保留一个视点：试图把唯一开启的视点关掉时拒绝。
+    const other = field === "fullLogUpstream" ? "fullLogClient" : "fullLogUpstream";
+    if (!value && !globalConfig[other]) {
+      toast.error(
+        t("proxy.settings.fields.fullLogMode.atLeastOne", {
+          defaultValue: "至少需要保留一个日志记录视点",
+        }),
+      );
+      return;
+    }
+    try {
+      await updateGlobalConfig.mutateAsync({
+        ...globalConfig,
+        [field]: value,
+      });
+    } catch (error) {
+      toast.error(
+        t("proxy.fullLogging.modeFailed", {
+          defaultValue: "切换日志记录模式失败",
+        }),
+      );
+    }
+  };
+
   const handleSaveBasicConfig = async () => {
     if (!globalConfig) return;
 
@@ -414,6 +470,103 @@ export function ProxyPanel({
                     disabled={updateGlobalConfig.isPending}
                   />
                 </div>
+              </div>
+
+              {/* [5b] Full request/response logging toggle */}
+              <div className="pt-3">
+                <div className="flex items-center justify-between rounded-md border border-border bg-background/60 px-3 py-2">
+                  <div className="space-y-0.5">
+                    <Label className="text-sm font-medium">
+                      {t("proxy.settings.fields.fullLogging.label", {
+                        defaultValue: "记录完整请求与响应",
+                      })}
+                    </Label>
+                    <p className="text-xs text-muted-foreground">
+                      {t("proxy.settings.fields.fullLogging.description", {
+                        defaultValue:
+                          "按会话写入 ~/.cc-switch/proxy_full_logs/<应用>/<session-id>.jsonl，可能包含 prompt、文件内容等隐私信息",
+                      })}
+                    </p>
+                  </div>
+                  <Switch
+                    checked={globalConfig?.fullLoggingEnabled ?? false}
+                    onCheckedChange={handleFullLoggingChange}
+                    disabled={updateGlobalConfig.isPending}
+                  />
+                </div>
+
+                {/* [5c] Full logging perspectives (Upstream / Client, 可同时开启) */}
+                <AnimatePresence initial={false}>
+                  {globalConfig?.fullLoggingEnabled && (
+                    <motion.div
+                      initial={{ opacity: 0, height: 0 }}
+                      animate={{ opacity: 1, height: "auto" }}
+                      exit={{ opacity: 0, height: 0 }}
+                      transition={{ duration: 0.15 }}
+                      className="overflow-hidden"
+                    >
+                      <div className="mt-2 rounded-md border border-border bg-background/60 px-3 py-2 space-y-2">
+                        <Label className="text-sm font-medium">
+                          {t("proxy.settings.fields.fullLogMode.label", {
+                            defaultValue: "日志记录视点",
+                          })}
+                        </Label>
+                        {/* Upstream 视点 */}
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="space-y-0.5">
+                            <Label className="text-sm">
+                              {t("proxy.settings.fields.fullLogMode.upstream", {
+                                defaultValue: "上游",
+                              })}
+                            </Label>
+                            <p className="text-xs text-muted-foreground">
+                              {t(
+                                "proxy.settings.fields.fullLogMode.upstreamDescription",
+                                {
+                                  defaultValue:
+                                    "记录转换后请求与上游原始响应（排查代理到上游的交互）",
+                                },
+                              )}
+                            </p>
+                          </div>
+                          <Switch
+                            checked={globalConfig?.fullLogUpstream ?? true}
+                            onCheckedChange={(v) =>
+                              handleFullLogFlagChange("fullLogUpstream", v)
+                            }
+                            disabled={updateGlobalConfig.isPending}
+                          />
+                        </div>
+                        {/* Client 视点 */}
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="space-y-0.5">
+                            <Label className="text-sm">
+                              {t("proxy.settings.fields.fullLogMode.client", {
+                                defaultValue: "客户端",
+                              })}
+                            </Label>
+                            <p className="text-xs text-muted-foreground">
+                              {t(
+                                "proxy.settings.fields.fullLogMode.clientDescription",
+                                {
+                                  defaultValue:
+                                    "记录客户端原始请求与转换后响应（复现客户端所见对话）",
+                                },
+                              )}
+                            </p>
+                          </div>
+                          <Switch
+                            checked={globalConfig?.fullLogClient ?? false}
+                            onCheckedChange={(v) =>
+                              handleFullLogFlagChange("fullLogClient", v)
+                            }
+                            disabled={updateGlobalConfig.isPending}
+                          />
+                        </div>
+                      </div>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
               </div>
 
               {/* [6] Provider queues */}

@@ -2833,6 +2833,18 @@
           "label": "リクエスト使用量を記録",
           "description": "ルーティングリクエストの使用量と状態をローカル統計データベースに保存"
         },
+        "fullLogging": {
+          "label": "リクエストとレスポンスを完全記録",
+          "description": "セッションごとに ~/.cc-switch/proxy_full_logs/<アプリ>/<session-id>.jsonl へ書き出します（messages、tool_use 等）。ファイル名は CLI のログと対応します。プロンプトや個人情報を含む可能性があります"
+        },
+        "fullLogMode": {
+          "label": "記録内容",
+          "upstream": "アップストリーム",
+          "client": "クライアント",
+          "upstreamDescription": "変換後リクエストとアップストリームの生レスポンスを記録（プロキシ↔アップストリームの調査向け）",
+          "clientDescription": "クライアントの元リクエストと変換後レスポンスを記録（クライアントが見た会話の再現向け）",
+          "atLeastOne": "ログ記録の視点を少なくとも1つ有効にしてください。"
+        },
         "streamingFirstByteTimeout": {
           "label": "ストリーミング初回バイトタイムアウト（秒）",
           "description": "最初のデータチャンクを待つ最大時間"

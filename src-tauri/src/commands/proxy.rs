@@ -116,8 +116,29 @@ pub async fn update_global_proxy_config(
     config: GlobalProxyConfig,
 ) -> Result<(), String> {
     let db = &state.db;
-    db.update_global_proxy_config(config)
+    db.update_global_proxy_config(config.clone())
         .await
+        .map_err(|e| e.to_string())?;
+
+    // 同步 full_logging_enabled 到运行中的代理 state（如果服务已在跑）
+    state
+        .proxy_service
+        .apply_full_logging_runtime(config.full_logging_enabled)
+        .await;
+    // 同步 full_log_upstream / full_log_client 到运行中的代理 state（如果服务已在跑）
+    state
+        .proxy_service
+        .apply_full_log_flags_runtime(config.full_log_upstream, config.full_log_client)
+        .await;
+
+    Ok(())
+}
+
+/// 获取代理 full-logging 日志目录路径，前端用于"打开日志目录"操作。
+#[tauri::command]
+pub fn get_proxy_full_log_dir() -> Result<String, String> {
+    crate::config::get_proxy_full_log_dir()
+        .map(|p| p.to_string_lossy().to_string())
         .map_err(|e| e.to_string())
 }
 

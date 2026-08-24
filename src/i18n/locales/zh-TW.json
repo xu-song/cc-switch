@@ -2834,6 +2834,18 @@
           "label": "記錄請求用量",
           "description": "將路由請求的用量與狀態寫入本機統計資料庫"
         },
+        "fullLogging": {
+          "label": "記錄完整請求與回應",
+          "description": "依工作階段寫入 ~/.cc-switch/proxy_full_logs/<應用>/<session-id>.jsonl（含 messages、tool_use 等），檔名與 CLI 日誌對應，可能包含 prompt 與隱私資訊"
+        },
+        "fullLogMode": {
+          "label": "記錄內容",
+          "upstream": "上游",
+          "client": "用戶端",
+          "upstreamDescription": "記錄轉換後請求與上游原始回應（排查代理到上游的互動）",
+          "clientDescription": "記錄用戶端原始請求與轉換後回應（重現用戶端所見對話）",
+          "atLeastOne": "至少需要保留一個日誌記錄視點。"
+        },
         "streamingFirstByteTimeout": {
           "label": "串流首位元組逾時（秒）",
           "description": "等待首個資料區塊的最大時間"

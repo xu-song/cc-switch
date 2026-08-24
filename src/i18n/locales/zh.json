@@ -2833,6 +2833,18 @@
           "label": "记录请求用量",
           "description": "将路由请求的用量与状态写入本地统计数据库"
         },
+        "fullLogging": {
+          "label": "记录完整请求与响应",
+          "description": "按会话写入 ~/.cc-switch/proxy_full_logs/<应用>/<session-id>.jsonl（含 messages、tool_use 等），文件名与 CLI 日志对应，可能包含 prompt 与隐私信息"
+        },
+        "fullLogMode": {
+          "label": "记录内容",
+          "upstream": "上游",
+          "client": "客户端",
+          "upstreamDescription": "记录转换后请求与上游原始响应（排查代理到上游的交互）",
+          "clientDescription": "记录客户端原始请求与转换后响应（复现客户端所见对话）",
+          "atLeastOne": "至少需要保留一个日志记录视点。"
+        },
         "streamingFirstByteTimeout": {
           "label": "流式首字超时（秒）",
           "description": "等待首个数据块的最大时间"

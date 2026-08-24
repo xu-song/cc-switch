@@ -63,7 +63,7 @@ impl Database {
         let result = {
             let conn = lock_conn!(self.conn);
             conn.query_row(
-                "SELECT proxy_enabled, listen_address, listen_port, enable_logging
+                "SELECT proxy_enabled, listen_address, listen_port, enable_logging, full_logging_enabled, full_log_upstream, full_log_client
                  FROM proxy_config WHERE app_type = 'claude'",
                 [],
                 |row| {
@@ -72,6 +72,9 @@ impl Database {
                         listen_address: row.get(1)?,
                         listen_port: row.get::<_, i32>(2)? as u16,
                         enable_logging: row.get::<_, i32>(3)? != 0,
+                        full_logging_enabled: row.get::<_, i32>(4)? != 0,
+                        full_log_upstream: row.get::<_, i32>(5)? != 0,
+                        full_log_client: row.get::<_, i32>(6)? != 0,
                     })
                 },
             )
@@ -88,6 +91,9 @@ impl Database {
                     listen_address: "127.0.0.1".to_string(),
                     listen_port: 15721,
                     enable_logging: true,
+                    full_logging_enabled: false,
+                    full_log_upstream: true,
+                    full_log_client: false,
                 })
             }
             Err(e) => Err(AppError::Database(e.to_string())),
@@ -107,12 +113,18 @@ impl Database {
                 listen_address = ?2,
                 listen_port = ?3,
                 enable_logging = ?4,
+                full_logging_enabled = ?5,
+                full_log_upstream = ?6,
+                full_log_client = ?7,
                 updated_at = datetime('now')",
             rusqlite::params![
                 if config.proxy_enabled { 1 } else { 0 },
                 config.listen_address,
                 config.listen_port as i32,
                 if config.enable_logging { 1 } else { 0 },
+                if config.full_logging_enabled { 1 } else { 0 },
+                if config.full_log_upstream { 1 } else { 0 },
+                if config.full_log_client { 1 } else { 0 },
             ],
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -423,7 +435,7 @@ impl Database {
             let conn = lock_conn!(self.conn);
             conn.query_row(
                 "SELECT listen_address, listen_port, max_retries,
-                        enable_logging,
+                        enable_logging, full_logging_enabled, full_log_upstream, full_log_client,
                         streaming_first_byte_timeout, streaming_idle_timeout, non_streaming_timeout
                  FROM proxy_config WHERE app_type = 'claude'",
                 [],
@@ -434,10 +446,13 @@ impl Database {
                         max_retries: row.get::<_, i32>(2)? as u8,
                         request_timeout: 600, // 废弃字段，返回默认值
                         enable_logging: row.get::<_, i32>(3)? != 0,
+                        full_logging_enabled: row.get::<_, i32>(4)? != 0,
+                        full_log_upstream: row.get::<_, i32>(5).unwrap_or(1) != 0,
+                        full_log_client: row.get::<_, i32>(6).unwrap_or(0) != 0,
                         live_takeover_active: false, // 废弃字段
-                        streaming_first_byte_timeout: row.get::<_, i32>(4).unwrap_or(60) as u64,
-                        streaming_idle_timeout: row.get::<_, i32>(5).unwrap_or(120) as u64,
-                        non_streaming_timeout: row.get::<_, i32>(6).unwrap_or(600) as u64,
+                        streaming_first_byte_timeout: row.get::<_, i32>(7).unwrap_or(60) as u64,
+                        streaming_idle_timeout: row.get::<_, i32>(8).unwrap_or(120) as u64,
+                        non_streaming_timeout: row.get::<_, i32>(9).unwrap_or(600) as u64,
                     })
                 },
             )

@@ -122,6 +122,12 @@ export interface GlobalProxyConfig {
   listenAddress: string;
   listenPort: number;
   enableLogging: boolean;
+  fullLoggingEnabled: boolean;
+  // 完整日志记录视点（可同时开启，至少需开启一个当 fullLoggingEnabled 为真时）
+  // - fullLogUpstream: 转换后请求 + 上游原始响应（排查代理↔上游）
+  // - fullLogClient: 客户端原始请求 + 转换后响应（复现客户端所见对话）
+  fullLogUpstream: boolean;
+  fullLogClient: boolean;
 }
 
 // 应用级代理配置（每个 app 独立）

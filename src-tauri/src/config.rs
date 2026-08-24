@@ -240,6 +240,16 @@ pub fn get_app_config_path() -> PathBuf {
     get_app_config_dir().join("config.json")
 }
 
+/// 获取代理 full-logging 日志目录 (`~/.cc-switch/proxy_full_logs/`)。
+///
+/// 不存在时创建。按会话切分的 JSONL（`<app_type>/<session-id>.jsonl`）
+/// 由 `proxy::full_logger` 写入。
+pub fn get_proxy_full_log_dir() -> Result<PathBuf, AppError> {
+    let dir = get_app_config_dir().join("proxy_full_logs");
+    fs::create_dir_all(&dir).map_err(|e| AppError::io(&dir, e))?;
+    Ok(dir)
+}
+
 /// 清理供应商名称，确保文件名安全
 #[allow(dead_code)]
 pub fn sanitize_provider_name(name: &str) -> String {

@@ -141,6 +141,13 @@ pub fn anthropic_to_openai_with_reasoning_content(
     body: Value,
     preserve_reasoning_content: bool,
 ) -> Result<Value, ProxyError> {
+    // 入口日志：完整 Anthropic 请求体（JSON 序列化字符串，便于排查）。
+    // body 可能很大（长 prompt / 多图 / 多工具）。
+    log::info!(
+        "[A2O] Anthropic→OpenAI 转换开始 (preserve_reasoning_content={preserve_reasoning_content}), 转换前请求体: {}",
+        serde_json::to_string(&body).unwrap_or_else(|e| format!("<序列化失败: {e}>"))
+    );
+
     let mut result = json!({});
 
     // NOTE: 模型映射由上游统一处理（proxy::model_mapper），格式转换层只做结构转换。
@@ -181,6 +188,12 @@ pub fn anthropic_to_openai_with_reasoning_content(
     }
 
     normalize_openai_system_messages(&mut messages);
+    // 中间日志：messages 转换 + system 归一化完成后的结果。
+    // log::info!(
+    //     "[A2O] messages 转换完成: 共 {} 条 OpenAI 消息, messages={}",
+    //     messages.len(),
+    //     serde_json::to_string(&messages).unwrap_or_else(|e| format!("<序列化失败: {e}>"))
+    // );
     result["messages"] = json!(messages);
 
     // 转换参数 — o-series 模型需要 max_completion_tokens
@@ -237,6 +250,12 @@ pub fn anthropic_to_openai_with_reasoning_content(
     if let Some(v) = body.get("tool_choice") {
         result["tool_choice"] = map_tool_choice_to_chat(v);
     }
+
+    // 出口日志：完整的 OpenAI Chat Completions 请求体。
+    log::info!(
+        "[A2O] Anthropic→OpenAI 转换完成, 转换后请求体: {}",
+        serde_json::to_string(&result).unwrap_or_else(|e| format!("<序列化失败: {e}>"))
+    );
 
     Ok(result)
 }
@@ -550,6 +569,11 @@ fn clean_schema_inner(mut schema: Value, is_root: bool) -> Value {
 
 /// OpenAI 响应 → Anthropic 响应
 pub fn openai_to_anthropic(body: Value) -> Result<Value, ProxyError> {
+    log::info!(
+        "[O2A] OpenAI→Anthropic 响应转换开始, 转换前响应体: {}",
+        serde_json::to_string(&body).unwrap_or_else(|e| format!("<序列化失败: {e}>"))
+    );
+
     let choices = body
         .get("choices")
         .and_then(|c| c.as_array())
@@ -742,6 +766,11 @@ pub fn openai_to_anthropic(body: Value) -> Result<Value, ProxyError> {
         "stop_sequence": null,
         "usage": usage_json
     });
+
+    log::info!(
+        "[O2A] OpenAI→Anthropic 响应转换完成, 转换后响应体: {}",
+        serde_json::to_string(&result).unwrap_or_else(|e| format!("<序列化失败: {e}>"))
+    );
 
     Ok(result)
 }

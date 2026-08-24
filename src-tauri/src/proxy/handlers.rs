@@ -183,9 +183,6 @@ async fn handle_messages_for_app(
     let body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
-    let mut ctx =
-        RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await?;
-
     let raw_endpoint = uri
         .path_and_query()
         .map(|path_and_query| path_and_query.as_str())
@@ -193,6 +190,17 @@ async fn handle_messages_for_app(
     let endpoint = strip_prefix
         .and_then(|prefix| raw_endpoint.strip_prefix(prefix))
         .unwrap_or(raw_endpoint);
+
+    let mut ctx = RequestContext::new(
+        &state,
+        &body,
+        &headers,
+        app_type.clone(),
+        tag,
+        app_type_str,
+        endpoint,
+    )
+    .await?;
 
     let is_stream = body
         .get("stream")
@@ -225,6 +233,15 @@ async fn handle_messages_for_app(
 
     let connection_guard = result.connection_guard.take();
     ctx.outbound_model = result.outbound_model.take();
+    if !result.outbound_endpoint.is_empty() {
+        ctx.outbound_endpoint = Some(std::mem::take(&mut result.outbound_endpoint));
+    }
+    if !result.outbound_request.is_null() {
+        ctx.outbound_request = Some(std::mem::replace(
+            &mut result.outbound_request,
+            serde_json::Value::Null,
+        ));
+    }
     ctx.provider = result.provider;
     let api_format = result
         .claude_api_format
@@ -424,6 +441,35 @@ async fn handle_claude_transform(
     if use_streaming {
         // 根据 api_format 选择流式转换器
         let stream = response.bytes_stream();
+
+        let log_upstream = super::response_processor::full_log_upstream(state);
+        let log_client = super::response_processor::full_log_client(state);
+
+        // Full-log：Upstream 视点开启时，在转换前旁路一份上游原始 SSE。
+        // 按 api_format 选 OpenAI 聚合器，记录转换前的上游原始报文。
+        // Client 视点的记录器后面挂在转换后的流上（两者可同时开启）。
+        let stream: Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin> =
+            if log_upstream {
+                if let Some(collector) =
+                    super::response_processor::create_full_log_collector_with_aggregator(
+                        ctx,
+                        state,
+                        super::full_logger::aggregator_for_api_format(api_format),
+                        true,
+                        status.as_u16(),
+                        super::FullLogPerspective::Upstream,
+                    )
+                {
+                    Box::new(Box::pin(super::full_logger::tee_raw_sse_for_full_log(
+                        stream, collector,
+                    )))
+                } else {
+                    Box::new(Box::pin(stream))
+                }
+            } else {
+                Box::new(Box::pin(stream))
+            };
+
         let sse_stream: Box<
             dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin,
         > = if api_format == "openai_responses" {
@@ -514,10 +560,27 @@ async fn handle_claude_transform(
         // 获取流式超时配置
         let timeout_config = ctx.streaming_timeout_config();
 
+        // Client 视点开启时在转换后流上挂 full-log 收集器（记录转换后的 Anthropic 响应）。
+        // Upstream 视点已在上方 tee_raw_sse_for_full_log 中记录原始响应。两者可同时开启。
+        let full_log_collector = if log_client {
+            super::response_processor::create_full_log_collector_with_aggregator(
+                ctx,
+                state,
+                super::full_logger::select_aggregator(ctx.app_type_str, &ctx.endpoint),
+                true,
+                status.as_u16(),
+                super::FullLogPerspective::Client,
+            )
+        } else {
+            None
+        };
+
+        // usage collector + （可选）Client 视点 full-log collector
         let logged_stream = create_logged_passthrough_stream(
             sse_stream,
             "Claude/OpenRouter",
             usage_collector,
+            full_log_collector,
             timeout_config,
             connection_guard,
         );
@@ -629,6 +692,28 @@ async fn handle_claude_transform(
         })
     });
 
+    // Full-log（非流式）：Upstream 视点在转换前记录上游原始响应。
+    // Client 视点在转换后记录（见下方）。两者可同时开启。
+    if super::response_processor::full_logging_enabled(state)
+        && super::response_processor::full_log_upstream(state)
+    {
+        super::response_processor::spawn_full_log_record(
+            ctx,
+            false,
+            direct_anthropic_response
+                .clone()
+                .or_else(|| upstream_response.clone())
+                .unwrap_or(Value::Null),
+            status.as_u16(),
+            if status.is_success() {
+                None
+            } else {
+                Some(format!("upstream status {}", status.as_u16()))
+            },
+            super::FullLogPerspective::Upstream,
+        );
+    }
+
     // 根据 api_format 选择非流式转换器
     let transform_result = match (direct_anthropic_response, upstream_response) {
         (Some(response), _) => Ok(response),
@@ -674,6 +759,24 @@ async fn handle_claude_transform(
     // 全 0 usage 不落账（对齐 Codex 流式收集器的 skip）：SSE 聚合兜底救回的流
     // 在上游缺 stream_options.include_usage 时没有 usage，写入只会产生无意义空行
     spawn_claude_usage_log(state, ctx, &anthropic_response, status.as_u16(), false);
+
+    // Client 视点：在转换后记录客户端收到的最终响应（与上方 Upstream 视点可同时开启）。
+    if super::response_processor::full_logging_enabled(state)
+        && super::response_processor::full_log_client(state)
+    {
+        super::response_processor::spawn_full_log_record(
+            ctx,
+            false,
+            anthropic_response.clone(),
+            status.as_u16(),
+            if status.is_success() {
+                None
+            } else {
+                Some(format!("upstream status {}", status.as_u16()))
+            },
+            super::FullLogPerspective::Client,
+        );
+    }
 
     // 构建响应
     let mut builder = axum::response::Response::builder().status(status);
@@ -776,9 +879,17 @@ pub async fn handle_chat_completions(
     let body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
-    let mut ctx =
-        RequestContext::new(&state, &body, &headers, AppType::Codex, "Codex", "codex").await?;
     let endpoint = endpoint_with_query(&uri, "/chat/completions");
+    let mut ctx = RequestContext::new(
+        &state,
+        &body,
+        &headers,
+        AppType::Codex,
+        "Codex",
+        "codex",
+        &endpoint,
+    )
+    .await?;
 
     let is_stream = body
         .get("stream")
@@ -810,6 +921,15 @@ pub async fn handle_chat_completions(
 
     let connection_guard = result.connection_guard.take();
     ctx.outbound_model = result.outbound_model.take();
+    if !result.outbound_endpoint.is_empty() {
+        ctx.outbound_endpoint = Some(std::mem::take(&mut result.outbound_endpoint));
+    }
+    if !result.outbound_request.is_null() {
+        ctx.outbound_request = Some(std::mem::replace(
+            &mut result.outbound_request,
+            serde_json::Value::Null,
+        ));
+    }
     ctx.provider = result.provider;
     let response = result.response;
 
@@ -866,9 +986,17 @@ async fn handle_responses_for_app(
     let body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
-    let mut ctx =
-        RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await?;
     let endpoint = endpoint_with_query(&uri, "/responses");
+    let mut ctx = RequestContext::new(
+        &state,
+        &body,
+        &headers,
+        AppType::Codex,
+        "Codex",
+        "codex",
+        &endpoint,
+    )
+    .await?;
 
     let is_stream = body
         .get("stream")
@@ -905,6 +1033,15 @@ async fn handle_responses_for_app(
 
     let connection_guard = result.connection_guard.take();
     ctx.outbound_model = result.outbound_model.take();
+    if !result.outbound_endpoint.is_empty() {
+        ctx.outbound_endpoint = Some(std::mem::take(&mut result.outbound_endpoint));
+    }
+    if !result.outbound_request.is_null() {
+        ctx.outbound_request = Some(std::mem::replace(
+            &mut result.outbound_request,
+            serde_json::Value::Null,
+        ));
+    }
     ctx.provider = result.provider;
     let response = result.response;
 
@@ -992,9 +1129,17 @@ pub async fn handle_alpha_search(
     let body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::InvalidRequest(format!("Failed to parse request body: {e}")))?;
 
-    let mut ctx =
-        RequestContext::new(&state, &body, &headers, AppType::Codex, "Codex", "codex").await?;
     let endpoint = endpoint_with_query(&uri, "/alpha/search");
+    let mut ctx = RequestContext::new(
+        &state,
+        &body,
+        &headers,
+        AppType::Codex,
+        "Codex",
+        "codex",
+        &endpoint,
+    )
+    .await?;
 
     let forwarder = ctx.create_forwarder(&state);
     let mut result = match forwarder
@@ -1068,9 +1213,17 @@ async fn handle_responses_compact_for_app(
     let body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
-    let mut ctx =
-        RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await?;
     let endpoint = endpoint_with_query(&uri, "/responses/compact");
+    let mut ctx = RequestContext::new(
+        &state,
+        &body,
+        &headers,
+        AppType::Codex,
+        "Codex",
+        "codex",
+        &endpoint,
+    )
+    .await?;
 
     let is_stream = body
         .get("stream")
@@ -1104,6 +1257,15 @@ async fn handle_responses_compact_for_app(
 
     let connection_guard = result.connection_guard.take();
     ctx.outbound_model = result.outbound_model.take();
+    if !result.outbound_endpoint.is_empty() {
+        ctx.outbound_endpoint = Some(std::mem::take(&mut result.outbound_endpoint));
+    }
+    if !result.outbound_request.is_null() {
+        ctx.outbound_request = Some(std::mem::replace(
+            &mut result.outbound_request,
+            serde_json::Value::Null,
+        ));
+    }
     ctx.provider = result.provider;
     let response = result.response;
 
@@ -1188,17 +1350,58 @@ async fn handle_codex_responses_namespace_restore(
             builder = builder.header(key, value);
         }
 
+        let log_upstream = super::response_processor::full_log_upstream(state);
+        let log_client = super::response_processor::full_log_client(state);
+
+        // Full-log Upstream 视点：namespace 还原前的上游原始 Responses SSE。
+        let stream: Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin> =
+            if log_upstream {
+                if let Some(collector) =
+                    super::response_processor::create_full_log_collector_with_aggregator(
+                        ctx,
+                        state,
+                        super::full_logger::aggregator_for_api_format("openai_responses"),
+                        true,
+                        status.as_u16(),
+                        super::FullLogPerspective::Upstream,
+                    )
+                {
+                    Box::new(Box::pin(super::full_logger::tee_raw_sse_for_full_log(
+                        response.bytes_stream(),
+                        collector,
+                    )))
+                } else {
+                    Box::new(Box::pin(response.bytes_stream()))
+                }
+            } else {
+                Box::new(Box::pin(response.bytes_stream()))
+            };
+
         let restore_stream =
             transform_codex_responses_namespace::create_namespace_restore_sse_stream(
-                response.bytes_stream(),
+                stream,
                 restore_map,
             );
         let usage_collector =
             create_usage_collector(ctx, state, status.as_u16(), &CODEX_PARSER_CONFIG);
+        // Client 视点：namespace 还原后的 Responses SSE。
+        let full_log_collector = if log_client {
+            super::response_processor::create_full_log_collector_with_aggregator(
+                ctx,
+                state,
+                super::full_logger::select_aggregator(ctx.app_type_str, &ctx.endpoint),
+                true,
+                status.as_u16(),
+                super::FullLogPerspective::Client,
+            )
+        } else {
+            None
+        };
         let logged_stream = create_logged_passthrough_stream(
             restore_stream,
             ctx.tag,
             usage_collector,
+            full_log_collector,
             ctx.streaming_timeout_config(),
             connection_guard,
         );
@@ -1228,10 +1431,37 @@ async fn handle_codex_responses_namespace_restore(
     // this only guards against a malformed upstream).
     let restored_bytes = match serde_json::from_slice::<Value>(&body_bytes) {
         Ok(mut value) => {
+            // Full-log Upstream 视点（非流式）：namespace 还原前的上游原始响应。
+            // 必须在 restore_response_namespaces 就地 mutate 之前记录。
+            if super::response_processor::full_logging_enabled(state)
+                && super::response_processor::full_log_upstream(state)
+            {
+                super::response_processor::spawn_full_log_record(
+                    ctx,
+                    false,
+                    value.clone(),
+                    status.as_u16(),
+                    None,
+                    super::FullLogPerspective::Upstream,
+                );
+            }
             transform_codex_responses_namespace::restore_response_namespaces(
                 &mut value,
                 &restore_map,
             );
+            // Full-log Client 视点（非流式）：namespace 还原后的响应。
+            if super::response_processor::full_logging_enabled(state)
+                && super::response_processor::full_log_client(state)
+            {
+                super::response_processor::spawn_full_log_record(
+                    ctx,
+                    false,
+                    value.clone(),
+                    status.as_u16(),
+                    None,
+                    super::FullLogPerspective::Client,
+                );
+            }
             if let Some(usage) =
                 TokenUsage::from_codex_response_auto(&value).filter(TokenUsage::has_billable_tokens)
             {
@@ -1321,6 +1551,34 @@ async fn handle_codex_chat_to_responses_transform(
 
     if is_stream || response.is_sse() {
         let stream = response.bytes_stream();
+
+        let log_upstream = super::response_processor::full_log_upstream(state);
+        let log_client = super::response_processor::full_log_client(state);
+
+        // Full-log：上游是原始 Chat Completions SSE。
+        // Upstream 视点在转换前旁路记录；Client 视点的记录器后面挂在转换后的流上。
+        let stream: Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin> =
+            if log_upstream {
+                if let Some(collector) =
+                    super::response_processor::create_full_log_collector_with_aggregator(
+                        ctx,
+                        state,
+                        super::full_logger::aggregator_for_api_format("openai"),
+                        true,
+                        status.as_u16(),
+                        super::FullLogPerspective::Upstream,
+                    )
+                {
+                    Box::new(Box::pin(super::full_logger::tee_raw_sse_for_full_log(
+                        stream, collector,
+                    )))
+                } else {
+                    Box::new(Box::pin(stream))
+                }
+            } else {
+                Box::new(Box::pin(stream))
+            };
+
         let sse_stream = create_responses_sse_stream_from_chat_with_context(stream, tool_context);
         let sse_stream = record_responses_sse_stream(sse_stream, state.codex_chat_history.clone());
 
@@ -1388,10 +1646,25 @@ async fn handle_codex_chat_to_responses_transform(
             None
         };
 
+        // Client 视点开启时在转换后流上挂 full-log 收集器（记录 Responses 格式）。
+        let full_log_collector = if log_client {
+            super::response_processor::create_full_log_collector_with_aggregator(
+                ctx,
+                state,
+                super::full_logger::select_aggregator(ctx.app_type_str, &ctx.endpoint),
+                true,
+                status.as_u16(),
+                super::FullLogPerspective::Client,
+            )
+        } else {
+            None
+        };
+
         let logged_stream = create_logged_passthrough_stream(
             sse_stream,
             ctx.tag,
             usage_collector,
+            full_log_collector,
             ctx.streaming_timeout_config(),
             connection_guard,
         );
@@ -1448,6 +1721,24 @@ async fn handle_codex_chat_to_responses_transform(
             ));
         }
     };
+    // Full-log（非流式）：Upstream 视点在转换前记录上游原始 Chat 响应。
+    if super::response_processor::full_logging_enabled(state)
+        && super::response_processor::full_log_upstream(state)
+    {
+        super::response_processor::spawn_full_log_record(
+            ctx,
+            false,
+            chat_response.clone(),
+            status.as_u16(),
+            if status.is_success() {
+                None
+            } else {
+                Some(format!("upstream status {}", status.as_u16()))
+            },
+            super::FullLogPerspective::Upstream,
+        );
+    }
+
     let responses_response = transform_codex_chat::chat_completion_to_response_with_context(
         chat_response,
         &tool_context,
@@ -1460,6 +1751,24 @@ async fn handle_codex_chat_to_responses_transform(
         .codex_chat_history
         .record_response(&responses_response)
         .await;
+
+    // Client 视点：在转换后记录客户端收到的 Responses 格式响应（与 Upstream 可同时开启）。
+    if super::response_processor::full_logging_enabled(state)
+        && super::response_processor::full_log_client(state)
+    {
+        super::response_processor::spawn_full_log_record(
+            ctx,
+            false,
+            responses_response.clone(),
+            status.as_u16(),
+            if status.is_success() {
+                None
+            } else {
+                Some(format!("upstream status {}", status.as_u16()))
+            },
+            super::FullLogPerspective::Client,
+        );
+    }
 
     // 上游非流式 Chat 省略 usage 时，chat_usage_to_responses_usage 会合成全 0 usage
     // (transform_codex_chat.rs:1581)，from_codex_response 对 input/output 字段存在(哪怕=0)
@@ -1560,14 +1869,58 @@ async fn handle_codex_anthropic_to_responses_transform(
     // envelopes and gateways that ignore stream:true can be converted faithfully.
     if response.is_sse() || (is_stream && !response.is_json()) {
         let stream = response.bytes_stream();
+
+        let log_upstream = super::response_processor::full_log_upstream(state);
+        let log_client = super::response_processor::full_log_client(state);
+
+        // Full-log：上游是原始 Anthropic Messages SSE。
+        // Upstream 视点在转换前旁路记录；Client 视点的收集器传入 build_codex_anthropic_sse_response
+        // 挂在转换后的 Responses 流上。
+        let stream: Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin> =
+            if log_upstream {
+                if let Some(collector) =
+                    super::response_processor::create_full_log_collector_with_aggregator(
+                        ctx,
+                        state,
+                        super::full_logger::aggregator_for_api_format("anthropic"),
+                        true,
+                        status.as_u16(),
+                        super::FullLogPerspective::Upstream,
+                    )
+                {
+                    Box::new(Box::pin(super::full_logger::tee_raw_sse_for_full_log(
+                        stream, collector,
+                    )))
+                } else {
+                    Box::new(Box::pin(stream))
+                }
+            } else {
+                Box::new(Box::pin(stream))
+            };
+
         let sse_stream =
             create_responses_sse_stream_from_anthropic_with_context(stream, codex_tool_context);
+
+        let full_log_collector = if log_client {
+            super::response_processor::create_full_log_collector_with_aggregator(
+                ctx,
+                state,
+                super::full_logger::select_aggregator(ctx.app_type_str, &ctx.endpoint),
+                true,
+                status.as_u16(),
+                super::FullLogPerspective::Client,
+            )
+        } else {
+            None
+        };
+
         return build_codex_anthropic_sse_response(
             sse_stream,
             ctx,
             state,
             status,
             connection_guard,
+            full_log_collector,
         );
     }
 
@@ -1607,6 +1960,35 @@ async fn handle_codex_anthropic_to_responses_transform(
     };
 
     if is_stream {
+        // 伪流式：上游已聚合为 Anthropic message Value（非 SSE 字节流），Upstream tee
+        // 不适用，走非流式 spawn 记录转换前的上游响应。
+        if super::response_processor::full_logging_enabled(state)
+            && super::response_processor::full_log_upstream(state)
+        {
+            super::response_processor::spawn_full_log_record(
+                ctx,
+                false,
+                anthropic_response.clone(),
+                status.as_u16(),
+                None,
+                super::FullLogPerspective::Upstream,
+            );
+        }
+
+        let log_client = super::response_processor::full_log_client(state);
+        let full_log_collector = if log_client {
+            super::response_processor::create_full_log_collector_with_aggregator(
+                ctx,
+                state,
+                super::full_logger::select_aggregator(ctx.app_type_str, &ctx.endpoint),
+                true,
+                status.as_u16(),
+                super::FullLogPerspective::Client,
+            )
+        } else {
+            None
+        };
+
         let events =
             responses_sse_events_from_anthropic_message(&anthropic_response, codex_tool_context);
         let sse_stream = futures::stream::iter(events.into_iter().map(Ok::<Bytes, std::io::Error>));
@@ -1616,10 +1998,27 @@ async fn handle_codex_anthropic_to_responses_transform(
             state,
             status,
             connection_guard,
+            full_log_collector,
         );
     }
 
     let _connection_guard = connection_guard;
+
+    // Full-log Upstream 视点（非流式）：转换前记录上游原始 Anthropic 响应。
+    // 必须在 anthropic_response 被 move 进转换器之前记录。
+    if super::response_processor::full_logging_enabled(state)
+        && super::response_processor::full_log_upstream(state)
+    {
+        super::response_processor::spawn_full_log_record(
+            ctx,
+            false,
+            anthropic_response.clone(),
+            status.as_u16(),
+            None,
+            super::FullLogPerspective::Upstream,
+        );
+    }
+
     let responses_response =
         transform_codex_anthropic::anthropic_response_to_responses_with_context(
             anthropic_response,
@@ -1629,6 +2028,20 @@ async fn handle_codex_anthropic_to_responses_transform(
             log::error!("[Codex] Failed to convert Anthropic response to Responses: {e}");
             e
         })?;
+
+    // Full-log Client 视点（非流式）：转换后记录客户端收到的 Responses 响应。
+    if super::response_processor::full_logging_enabled(state)
+        && super::response_processor::full_log_client(state)
+    {
+        super::response_processor::spawn_full_log_record(
+            ctx,
+            false,
+            responses_response.clone(),
+            status.as_u16(),
+            None,
+            super::FullLogPerspective::Client,
+        );
+    }
 
     if let Some(usage) = TokenUsage::from_codex_response_auto(&responses_response)
         .filter(TokenUsage::has_billable_tokens)
@@ -1703,6 +2116,7 @@ fn build_codex_anthropic_sse_response(
     state: &ProxyState,
     status: StatusCode,
     connection_guard: Option<ActiveConnectionGuard>,
+    full_log_collector: Option<super::full_logger::SseFullLogCollector>,
 ) -> Result<axum::response::Response, ProxyError> {
     let usage_collector = if usage_logging_enabled(state) {
         let state = state.clone();
@@ -1765,6 +2179,7 @@ fn build_codex_anthropic_sse_response(
         sse_stream,
         ctx.tag,
         usage_collector,
+        full_log_collector,
         ctx.streaming_timeout_config(),
         connection_guard,
     );
@@ -2073,9 +2488,23 @@ pub async fn handle_gemini(
     };
 
     // Gemini 的模型名称在 URI 中
-    let mut ctx = RequestContext::new(&state, &body, &headers, AppType::Gemini, "Gemini", "gemini")
-        .await?
-        .with_model_from_uri(&uri);
+    // 这里先把 endpoint 当成临时值传给 ctx::new；with_model_from_uri 会再用
+    // path_and_query 覆盖一次，确保 full-log 拿到带 query 的完整 endpoint。
+    let endpoint_tmp = uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or(uri.path());
+    let mut ctx = RequestContext::new(
+        &state,
+        &body,
+        &headers,
+        AppType::Gemini,
+        "Gemini",
+        "gemini",
+        endpoint_tmp,
+    )
+    .await?
+    .with_model_from_uri(&uri);
 
     // 提取完整的路径和查询参数
     let endpoint = uri
@@ -2113,6 +2542,15 @@ pub async fn handle_gemini(
 
     let connection_guard = result.connection_guard.take();
     ctx.outbound_model = result.outbound_model.take();
+    if !result.outbound_endpoint.is_empty() {
+        ctx.outbound_endpoint = Some(std::mem::take(&mut result.outbound_endpoint));
+    }
+    if !result.outbound_request.is_null() {
+        ctx.outbound_request = Some(std::mem::replace(
+            &mut result.outbound_request,
+            serde_json::Value::Null,
+        ));
+    }
     ctx.provider = result.provider;
     let response = result.response;
 
